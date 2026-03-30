@@ -204,15 +204,46 @@ class Cpp_UAF_Extractor(DFBScanExtractor):
         release_node: tree_sitter.Node,
         released_expr: str,
     ) -> set[str]:
-        live_aliases = {self._normalize_expr(released_expr)}
-        for node in self._assignment_nodes(root_node):
+        released_alias = self._normalize_expr(released_expr)
+        if not released_alias:
+            return set()
+
+        # Track aliases that are definitely live at the release point.
+        live_aliases = {released_alias}
+
+        # Track which aliases can still explain earlier copy assignments when
+        # we walk backwards from the release point.
+        backward_trace_aliases = {released_alias}
+
+        # A later non-alias assignment kills any earlier alias copies into the
+        # same lhs, so block them when scanning backwards.
+        killed_alias_targets: set[str] = set()
+
+        for node in reversed(self._assignment_nodes(root_node)):
             if node.start_byte >= release_node.start_byte:
-                break
+                continue
+
             event = self._extract_assignment_event(node, source_code)
             if event is None:
                 continue
+
             _, _, lhs, rhs = event
-            self._apply_assignment_to_aliases(live_aliases, lhs, rhs)
+            if not lhs:
+                continue
+
+            rhs_is_alias = self._is_live_alias_expr(rhs, backward_trace_aliases)
+            lhs_is_trace_alias = lhs in backward_trace_aliases
+
+            if lhs != released_alias and not rhs_is_alias:
+                killed_alias_targets.add(lhs)
+
+            if lhs_is_trace_alias and not rhs_is_alias:
+                backward_trace_aliases.discard(lhs)
+
+            if rhs_is_alias and lhs not in killed_alias_targets:
+                live_aliases.add(lhs)
+                backward_trace_aliases.add(lhs)
+
         return live_aliases
 
     def _matches_released_object(

@@ -16,6 +16,31 @@ class Cpp_TSAnalyzer(TSAnalyzer):
     Implements language-specific parsing and analysis.
     """
 
+    def _get_definition_declarator(
+        self, function_definition_node: tree_sitter.Node
+    ) -> tree_sitter.Node | None:
+        """
+        Return the declarator that belongs to the current function definition,
+        excluding declarators nested inside the function body (for example local
+        struct constructors).
+        """
+        body_start_byte = function_definition_node.end_byte
+        for child in function_definition_node.named_children:
+            if child.type == "compound_statement":
+                body_start_byte = child.start_byte
+                break
+
+        candidates = [
+            node
+            for node in find_nodes_by_type(function_definition_node, "function_declarator")
+            if node.start_byte < body_start_byte
+        ]
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda node: (node.start_byte, -(node.end_byte - node.start_byte)))
+        return candidates[0]
+
     def extract_function_info(
         self, file_path: str, source_code: str, tree: tree_sitter.Tree
     ) -> None:
@@ -26,37 +51,40 @@ class Cpp_TSAnalyzer(TSAnalyzer):
         for function_definition_node in find_nodes_by_type(
             tree.root_node, "function_definition"
         ):
-            for function_declaration_node in find_nodes_by_type(
-                function_definition_node, "function_declarator"
-            ):
-                function_name = ""
-                for sub_node in function_declaration_node.children:
-                    if sub_node.type in {"identifier", "field_identifier"}:
-                        function_name = get_node_text(source_bytes, sub_node)
-                        break
-                    elif sub_node.type == "qualified_identifier":
-                        qualified_function_name = get_node_text(source_bytes, sub_node)
-                        function_name = qualified_function_name.split("::")[-1]
-                        break
-                if function_name == "":
-                    continue
+            function_declaration_node = self._get_definition_declarator(
+                function_definition_node
+            )
+            if function_declaration_node is None:
+                continue
 
-                # Initialize the raw data of a function
-                start_line_number = get_node_start_line(function_definition_node)
-                end_line_number = get_node_end_line(function_definition_node)
-                function_id = len(self.functionRawDataDic) + 1
+            function_name = ""
+            for sub_node in function_declaration_node.children:
+                if sub_node.type in {"identifier", "field_identifier"}:
+                    function_name = get_node_text(source_bytes, sub_node)
+                    break
+                elif sub_node.type == "qualified_identifier":
+                    qualified_function_name = get_node_text(source_bytes, sub_node)
+                    function_name = qualified_function_name.split("::")[-1]
+                    break
+            if function_name == "":
+                continue
 
-                self.functionRawDataDic[function_id] = (
-                    function_name,
-                    start_line_number,
-                    end_line_number,
-                    function_definition_node,
-                )
-                self.functionToFile[function_id] = file_path
+            # Initialize the raw data of a function
+            start_line_number = get_node_start_line(function_definition_node)
+            end_line_number = get_node_end_line(function_definition_node)
+            function_id = len(self.functionRawDataDic) + 1
 
-                if function_name not in self.functionNameToId:
-                    self.functionNameToId[function_name] = set([])
-                self.functionNameToId[function_name].add(function_id)
+            self.functionRawDataDic[function_id] = (
+                function_name,
+                start_line_number,
+                end_line_number,
+                function_definition_node,
+            )
+            self.functionToFile[function_id] = file_path
+
+            if function_name not in self.functionNameToId:
+                self.functionNameToId[function_name] = set([])
+            self.functionNameToId[function_name].add(function_id)
         return
 
     def extract_global_info(
