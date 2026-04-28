@@ -18,6 +18,7 @@ from tstool.dfbscan_extractor.Cpp.Cpp_UAF_extractor import *
 
 from llmtool.LLM_utils import *
 from llmtool.dfbscan.intra_dataflow_analyzer import *
+from llmtool.dfbscan.fallback_bug_validator import *
 from llmtool.dfbscan.path_validator import *
 
 from memory.semantic.dfbscan_state import *
@@ -81,6 +82,14 @@ class DFBScanAgent(Agent):
             self.memory_agent,
         )
         self.path_validator = PathValidator(
+            self.model_name,
+            self.temperature,
+            self.language,
+            self.MAX_QUERY_NUM,
+            self.logger,
+            self.memory_agent,
+        )
+        self.fallback_bug_validator = FallbackBugValidator(
             self.model_name,
             self.temperature,
             self.language,
@@ -158,6 +167,161 @@ class DFBScanAgent(Agent):
         if candidate_value.file != current_function.file_path:
             return True
         return candidate_value.line_number > start_value.line_number
+
+    def __supports_sink_fallback(self) -> bool:
+        return self.is_reachable and self.bug_type in {"NPD", "UAF"}
+
+    def __record_fallback_value(
+        self,
+        fallback_functions: Dict[int, Function],
+        observed_values_by_function: Dict[int, Set[Value]],
+        value: Value,
+    ) -> None:
+        function = self.ts_analyzer.get_function_from_localvalue(value)
+        if function is None:
+            return
+        fallback_functions[function.function_id] = function
+        if function.function_id not in observed_values_by_function:
+            observed_values_by_function[function.function_id] = set()
+        observed_values_by_function[function.function_id].add(value)
+
+    def __ordered_fallback_functions(
+        self, src_function: Function, fallback_functions: Dict[int, Function]
+    ) -> List[Function]:
+        other_functions = [
+            function
+            for function_id, function in fallback_functions.items()
+            if function_id != src_function.function_id
+        ]
+        other_functions.sort(
+            key=lambda function: (
+                function.file_path,
+                function.start_line_number,
+                function.function_name,
+            )
+        )
+        return [src_function] + other_functions
+
+    def __validate_buggy_path(
+        self,
+        src_value: Value,
+        buggy_path: List[Value],
+        local_state: DFBScanState,
+        detection_mode: str = "strict",
+        report_confidence: str = "high",
+        explanation_prefix: str = "",
+    ) -> bool:
+        values_to_functions = {
+            value: self.ts_analyzer.get_function_from_localvalue(value)
+            for value in buggy_path
+        }
+        buggy_value = self.__buggy_value_for_path(src_value, buggy_path)
+
+        functions: Set[Function] = set()
+        for func in values_to_functions.values():
+            if func is not None:
+                functions.add(func)
+
+        if local_state.check_existence(buggy_value, functions):
+            return False
+
+        pv_input = PathValidatorInput(
+            self.bug_type,
+            buggy_path,
+            values_to_functions,
+        )
+        pv_output = self.path_validator.invoke(pv_input, PathValidatorOutput)
+
+        if pv_output is None or not pv_output.is_reachable:
+            return False
+
+        relevant_functions = {}
+        for value in buggy_path:
+            function = self.ts_analyzer.get_function_from_localvalue(value)
+            if function is not None:
+                relevant_functions[function.function_id] = function
+
+        explanation = pv_output.explanation_str
+        if explanation_prefix:
+            explanation = explanation_prefix + "\n\n" + explanation
+
+        bug_report = BugReport(
+            self.bug_type,
+            buggy_value,
+            relevant_functions,
+            explanation,
+            source_value=src_value,
+            buggy_path=buggy_path,
+            detection_mode=detection_mode,
+            report_confidence=report_confidence,
+        )
+        local_state.update_bug_report(bug_report)
+        return True
+
+    def __run_sink_fallback(
+        self,
+        src_value: Value,
+        src_function: Function,
+        local_state: DFBScanState,
+        fallback_functions: Dict[int, Function],
+        observed_values_by_function: Dict[int, Set[Value]],
+        fallback_trigger_reasons: Set[str],
+    ) -> bool:
+        if not self.__supports_sink_fallback() or not fallback_trigger_reasons:
+            return False
+
+        ordered_functions = self.__ordered_fallback_functions(
+            src_function, fallback_functions
+        )
+        observed_values_input = {
+            function_id: sorted(
+                values,
+                key=lambda value: (value.line_number, value.name, value.index),
+            )
+            for function_id, values in observed_values_by_function.items()
+        }
+        fallback_input = FallbackBugValidatorInput(
+            self.bug_type,
+            src_value,
+            src_function,
+            ordered_functions,
+            observed_values_input,
+            sorted(fallback_trigger_reasons),
+        )
+        fallback_output = self.fallback_bug_validator.invoke(
+            fallback_input, FallbackBugValidatorOutput
+        )
+
+        if (
+            fallback_output is None
+            or not fallback_output.is_reachable
+            or fallback_output.sink_value is None
+        ):
+            return False
+
+        synthetic_buggy_path = [src_value, fallback_output.sink_value]
+        fallback_details = [
+            "Fallback sink discovery was used because the strict sink pipeline did not produce a usable candidate path.",
+            "Fallback trigger reasons:",
+        ]
+        fallback_details.extend(
+            f"- {reason}" for reason in sorted(fallback_trigger_reasons)
+        )
+        if fallback_output.path_summary:
+            fallback_details.append(
+                "Fallback path summary: " + fallback_output.path_summary
+            )
+        fallback_details.append(
+            "Fallback rationale: " + fallback_output.explanation_str
+        )
+        return self.__validate_buggy_path(
+            src_value,
+            synthetic_buggy_path,
+            local_state,
+            detection_mode="fallback",
+            report_confidence="low",
+            explanation_prefix="\n".join(fallback_details),
+        )
 
     def __update_worklist(
         self,
@@ -449,124 +613,10 @@ class DFBScanAgent(Agent):
             total=total_src_values, desc="Processing Source Values", unit="src"
         ) as pbar:
             for src_value in self.src_values:
-                worklist = []
-                src_function = self.ts_analyzer.get_function_from_localvalue(src_value)
-                if src_function is None:
-                    pbar.update(1)
-                    continue
-
-                initial_context = CallContext(False)
-                worklist.append((src_value, src_function, initial_context))
-
-                while len(worklist) > 0:
-                    (start_value, start_function, call_context) = worklist.pop(0)
-                    if len(call_context.context) >= self.call_depth:
-                        continue
-
-                    # Construct the input for intra-procedural data-flow analysis
-                    sink_values = self.__obtain_sink_values_for_function(
-                        start_function, start_value
-                    )
-
-                    call_statements = []
-                    for call_site_node in start_function.function_call_site_nodes:
-                        file_content = self.ts_analyzer.code_in_files[
-                            start_function.file_path
-                        ]
-                        call_site_line_number = get_node_start_line(call_site_node)
-                        call_site_name = get_node_text(file_content, call_site_node)
-                        call_statements.append((call_site_name, call_site_line_number))
-
-                    ret_values = [
-                        (
-                            ret.name,
-                            ret.line_number - start_function.start_line_number + 1,
-                        )
-                        for ret in (
-                            start_function.retvals
-                            if start_function.retvals is not None
-                            else []
-                        )
-                    ]
-                    df_input = IntraDataFlowAnalyzerInput(
-                        start_function,
-                        start_value,
-                        sink_values,
-                        call_statements,
-                        ret_values,
-                    )
-
-                    # Invoke the intra-procedural data-flow analysis
-                    df_output = self.intra_dfa.invoke(
-                        df_input, IntraDataFlowAnalyzerOutput
-                    )
-                    if df_output is None:
-                        continue
-
-                    for path_index in range(len(df_output.reachable_values)):
-                        reachable_values_in_single_path = set([])
-                        for value in df_output.reachable_values[path_index]:
-                            if not self.__is_temporally_valid_uaf_value(
-                                start_value, value, start_function
-                            ):
-                                continue
-                            reachable_values_in_single_path.add((value, call_context))
-                        self.state.update_reachable_values_per_path(
-                            (start_value, call_context), reachable_values_in_single_path
-                        )
-
-                        delta_worklist = self.__update_worklist(
-                            df_input, df_output, call_context, path_index, self.state
-                        )
-                        worklist.extend(delta_worklist)
-
-                self.__collect_potential_buggy_paths(
-                    src_value, (src_value, CallContext(False)), self.state
-                )
-
-                if src_value not in self.state.potential_buggy_paths:
-                    pbar.update(1)
-                    continue
-
-                for buggy_path in self.state.potential_buggy_paths[src_value].values():
-                    pv_input = PathValidatorInput(
-                        self.bug_type,
-                        buggy_path,
-                        {
-                            value: self.ts_analyzer.get_function_from_localvalue(value)
-                            for value in buggy_path
-                        },
-                    )
-                    pv_output = self.path_validator.invoke(
-                        pv_input, PathValidatorOutput
-                    )
-
-                    if pv_output is None:
-                        continue
-
-                    if pv_output.is_reachable:
-                        relevant_functions = {}
-                        for value in buggy_path:
-                            function = self.ts_analyzer.get_function_from_localvalue(
-                                value
-                            )
-                            if function is not None:
-                                relevant_functions[function.function_id] = function
-
-                        bug_report = BugReport(
-                            self.bug_type,
-                            self.__buggy_value_for_path(src_value, buggy_path),
-                            relevant_functions,
-                            pv_output.explanation_str,
-                            source_value=src_value,
-                            buggy_path=buggy_path,
-                        )
-                        self.state.update_bug_report(bug_report)
-
-                # Dump bug reports
-                self._dump_bug_reports()
-
-                # Update the progress bar
+                worker_state = self.__process_src_value(src_value)
+                self.state.merge_from(worker_state)
+                if worker_state.total_bug_count > 0:
+                    self._dump_bug_reports()
                 pbar.update(1)
 
         # Final summary
@@ -637,17 +687,33 @@ class DFBScanAgent(Agent):
         if src_function is None:
             return local_state
         initial_context = CallContext(False)
+        fallback_functions: Dict[int, Function] = {
+            src_function.function_id: src_function
+        }
+        observed_values_by_function: Dict[int, Set[Value]] = {
+            src_function.function_id: {src_value}
+        }
+        fallback_trigger_reasons: Set[str] = set()
 
         worklist.append((src_value, src_function, initial_context))
         while len(worklist) > 0:
             (start_value, start_function, call_context) = worklist.pop(0)
             if len(call_context.context) > self.call_depth:
                 continue
+            self.__record_fallback_value(
+                fallback_functions, observed_values_by_function, start_value
+            )
 
             # Construct the input for intra-procedural data-flow analysis
             sink_values = self.__obtain_sink_values_for_function(
                 start_function, start_value
             )
+            if self.__supports_sink_fallback() and not sink_values:
+                fallback_trigger_reasons.add(
+                    "No known sinks were extracted for "
+                    f"{start_value.name} in function {start_function.function_name} "
+                    f"({start_function.file_path}:{start_value.line_number})."
+                )
 
             call_statements = []
             for call_site_node in start_function.function_call_site_nodes:
@@ -671,6 +737,16 @@ class DFBScanAgent(Agent):
 
             if df_output is None:
                 continue
+            if (
+                self.__supports_sink_fallback()
+                and df_output.response_mentions_sink
+                and df_output.parsed_sink_count == 0
+            ):
+                fallback_trigger_reasons.add(
+                    "The intra-procedural model mentioned a sink, but no structured "
+                    f"Sink record was parsed in function {start_function.function_name} "
+                    f"({start_function.file_path})."
+                )
 
             for path_index in range(len(df_output.reachable_values)):
                 reachable_values_in_single_path = set([])
@@ -679,6 +755,9 @@ class DFBScanAgent(Agent):
                         start_value, value, start_function
                     ):
                         continue
+                    self.__record_fallback_value(
+                        fallback_functions, observed_values_by_function, value
+                    )
                     reachable_values_in_single_path.add((value, call_context))
                 local_state.update_reachable_values_per_path(
                     (start_value, call_context), reachable_values_in_single_path
@@ -696,50 +775,23 @@ class DFBScanAgent(Agent):
 
         # If no potential buggy paths are found, return early
         if src_value not in local_state.potential_buggy_paths:
+            if self.__supports_sink_fallback():
+                fallback_trigger_reasons.add(
+                    "Strict path collection did not produce any potential buggy path."
+                )
+                self.__run_sink_fallback(
+                    src_value,
+                    src_function,
+                    local_state,
+                    fallback_functions,
+                    observed_values_by_function,
+                    fallback_trigger_reasons,
+                )
             return local_state
 
         # Validate buggy paths and generate bug reports
         for buggy_path in local_state.potential_buggy_paths[src_value].values():
-            values_to_functions = {
-                value: self.ts_analyzer.get_function_from_localvalue(value)
-                for value in buggy_path
-            }
-            buggy_value = self.__buggy_value_for_path(src_value, buggy_path)
-
-            functions: Set[Function] = set()
-            for func in values_to_functions.values():
-                if func is not None:
-                    functions.add(func)
-
-            if local_state.check_existence(buggy_value, functions):
-                continue
-
-            pv_input = PathValidatorInput(
-                self.bug_type,
-                buggy_path,
-                values_to_functions,
-            )
-            pv_output = self.path_validator.invoke(pv_input, PathValidatorOutput)
-
-            if pv_output is None:
-                continue
-
-            if pv_output.is_reachable:
-                relevant_functions = {}
-                for value in buggy_path:
-                    function = self.ts_analyzer.get_function_from_localvalue(value)
-                    if function is not None:
-                        relevant_functions[function.function_id] = function
-
-                bug_report = BugReport(
-                    self.bug_type,
-                    buggy_value,
-                    relevant_functions,
-                    pv_output.explanation_str,
-                    source_value=src_value,
-                    buggy_path=buggy_path,
-                )
-                local_state.update_bug_report(bug_report)
+            self.__validate_buggy_path(src_value, buggy_path, local_state)
         return local_state
 
     def get_agent_state(self) -> DFBScanState:

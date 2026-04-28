@@ -178,3 +178,5 @@ poc/**
 log/**
 
 *.bak
+
+demos/**

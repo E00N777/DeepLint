@@ -13,6 +13,8 @@ class BugReport:
         source_value: Value | None = None,
         buggy_path: list[Value] | None = None,
         is_human_confirmed_true: bool = False,
+        detection_mode: str = "strict",
+        report_confidence: str = "high",
     ) -> None:
         """
         :param bug_type: the bug type
@@ -27,6 +29,8 @@ class BugReport:
         self.source_value = source_value
         self.buggy_path = buggy_path or []
         self.is_human_confirmed_true = is_human_confirmed_true
+        self.detection_mode = detection_mode
+        self.report_confidence = report_confidence
         return
 
     def to_dict(self) -> dict:
@@ -52,6 +56,8 @@ class BugReport:
                 ],
             ],
             "explanation": self.explanation,
+            "detection_mode": self.detection_mode,
+            "report_confidence": self.report_confidence,
             "is_human_confirmed_true": (
                 str(self.is_human_confirmed_true)
                 if self.is_human_confirmed_true is not None

@@ -33,8 +33,17 @@ class IntraDataFlowAnalyzerInput(LLMToolInput):
 
 
 class IntraDataFlowAnalyzerOutput(LLMToolOutput):
-    def __init__(self, reachable_values: List[Set[Value]]) -> None:
+    def __init__(
+        self,
+        reachable_values: List[Set[Value]],
+        raw_response: str = "",
+        response_mentions_sink: bool = False,
+        parsed_sink_count: int = 0,
+    ) -> None:
         self.reachable_values = reachable_values
+        self.raw_response = raw_response
+        self.response_mentions_sink = response_mentions_sink
+        self.parsed_sink_count = parsed_sink_count
         return
 
     def __str__(self):
@@ -159,6 +168,9 @@ class IntraDataFlowAnalyzer(LLMTool):
 
         answer_idx = response.find("Answer:")
         answer_section = response[answer_idx:] if answer_idx != -1 else response
+        response_mentions_sink = (
+            re.search(r"\bsink\b", answer_section, re.IGNORECASE) is not None
+        )
 
         current_path = None
         for line in answer_section.splitlines():
@@ -198,6 +210,7 @@ class IntraDataFlowAnalyzer(LLMTool):
         reachable_values = []
         file_path = input.function.file_path
         start_line_number = input.function.start_line_number
+        parsed_sink_count = 0
 
         for single_path in paths:
             reachable_values_per_path = set()
@@ -236,12 +249,18 @@ class IntraDataFlowAnalyzer(LLMTool):
                         )
                     )
                 elif detail["type"] == "Sink":
+                    parsed_sink_count += 1
                     reachable_values_per_path.add(
                         Value(detail["name"], line_number, ValueLabel.SINK, file_path)
                     )
             reachable_values.append(reachable_values_per_path)
 
-        output = IntraDataFlowAnalyzerOutput(reachable_values)
+        output = IntraDataFlowAnalyzerOutput(
+            reachable_values,
+            response,
+            response_mentions_sink,
+            parsed_sink_count,
+        )
         if self.memory_agent is not None:
             self.memory_agent.record_intra_result(
                 input.function, input.summary_start, output.reachable_values

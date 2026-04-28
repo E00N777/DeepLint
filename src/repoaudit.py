@@ -1,7 +1,5 @@
 import argparse
 import os
-import glob
-import sys
 from agent.metascan import *
 from agent.dfbscan import *
 

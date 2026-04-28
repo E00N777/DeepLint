@@ -1,0 +1,48 @@
+{
+  "task": "You are performing fallback bug validation for a <BUG_TYPE> candidate after the strict sink-matching pipeline failed to produce a usable sink. Based on the provided source and function contexts, decide whether there is still a likely reachable bug and, if so, identify the most likely sink precisely.",
+  "analysis_rules_common": [
+    "## Analysis Goals",
+    "- Treat the provided source as the starting point of the candidate bug.",
+    "- You may identify a sink even if it was not listed by the strict pipeline.",
+    "- Use only the provided code and function contexts. Do not assume hidden behavior.",
+    "- Prefer a precise sink expression that appears verbatim in the code.",
+    "- If multiple sinks are possible, choose the best-supported one.",
+    "- If you cannot identify a precise sink with enough confidence, answer No."
+  ],
+  "analysis_rules_by_type": {
+    "NPD": [
+      "## NPD Rules",
+      "- The source must be null or potentially null.",
+      "- The sink must dereference the same value or a clear alias of it.",
+      "- A guarding null check, reassignment to non-null, or contradictory branch condition means Answer: No."
+    ],
+    "UAF": [
+      "## UAF Rules",
+      "- The source denotes the released object, not the whole free/delete statement.",
+      "- The sink must be a later use of that same object or a clear alias.",
+      "- If the object is replaced, detached, deep-copied, or the code returns before the use, answer No.",
+      "- Cleanup-only error paths and unrelated object accesses are not UAF sinks."
+    ]
+  },
+  "answer_format": [
+    "## Required Output Format",
+    "- If a likely bug exists, respond exactly in this shape:",
+    "Answer: Yes",
+    "ContextId: <context id from the list below>",
+    "Function: <function name>",
+    "Sink: <sink expression copied from the code>",
+    "Line: <absolute line number of the sink>",
+    "Path: <short path summary from source to sink>",
+    "Reason: <one concise sentence explaining why this is a likely true-positive bug>",
+    "- If no likely bug exists, respond exactly in this shape:",
+    "Answer: No",
+    "Reason: <one concise sentence explaining why the candidate is not strong enough>"
+  ],
+  "meta_prompts": [
+    "Candidate bug type: <BUG_TYPE>\n",
+    "Source under review: <SOURCE>\n",
+    "Why fallback was triggered:\n<TRIGGER_REASONS>\n",
+    "Function contexts available to you:\n<FUNCTION_INDEX>\n\n",
+    "Detailed function contexts:\n<FUNCTION_CONTEXTS>\n"
+  ]
+}

@@ -6,6 +6,7 @@ from memory.syntactic.function import Function
 
 COMMON_UAF_API_SUMMARIES = {
     "SNMP_FREE": "Frees the pointed heap object and writes NULL back to the same lvalue. A later use of that variable requires a re-assignment first.",
+    "SNMP_SWIPE_MEM": "Frees the previous destination buffer, moves the source pointer into that destination, and nulls the source variable. This is a replacement pattern, not a direct UAF of the new active pointer.",
     "strdup": "Returns a freshly allocated copy of the input string. Freeing the original pointer after strdup is normally not UAF.",
     "strndup": "Returns a freshly allocated copy of the input string prefix. The returned object is independent from the source buffer.",
     "memdup": "Duplicates the source buffer into new heap storage. Original and duplicate have separate ownership.",

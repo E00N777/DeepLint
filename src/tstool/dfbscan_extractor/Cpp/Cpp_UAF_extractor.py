@@ -31,25 +31,16 @@ NETSNMP_UAF_RELEASE_CALLS = (
     "netsnmp_handler_registration_free",
     "netsnmp_free_all_list_data",
     "netsnmp_table_registration_info_free",
-    "netsnmp_cache_free",
     "netsnmp_directory_container_free",
-    "netsnmp_access_arp_container_free",
     "netsnmp_access_arp_entry_free",
-    "netsnmp_access_defaultrouter_container_free",
     "netsnmp_access_defaultrouter_entry_free",
     "netsnmp_access_interface_container_free",
     "netsnmp_access_interface_entry_free",
-    "netsnmp_access_ipaddress_container_free",
     "netsnmp_access_ipaddress_entry_free",
-    "netsnmp_access_route_container_free",
     "netsnmp_access_route_entry_free",
-    "netsnmp_access_scopezone_container_free",
     "netsnmp_access_scopezone_entry_free",
-    "netsnmp_access_systemstats_container_free",
     "netsnmp_access_systemstats_entry_free",
-    "netsnmp_access_tcpconn_container_free",
     "netsnmp_access_tcpconn_entry_free",
-    "netsnmp_access_udp_endpoint_container_free",
     "netsnmp_access_udp_endpoint_entry_free",
     "netsnmp_swinst_container_free",
     "netsnmp_swinst_entry_free",
@@ -61,6 +52,10 @@ NETSNMP_UAF_RELEASE_CALLS = (
 UAF_RELEASE_CALL_ARGUMENT_INDEXES = {
     **GENERIC_UAF_RELEASE_CALL_ARGUMENT_INDEXES,
     **{name: 0 for name in NETSNMP_UAF_RELEASE_CALLS},
+}
+
+NULLING_UAF_RELEASE_CALLS = {
+    "SNMP_FREE",
 }
 
 
@@ -80,6 +75,7 @@ class Cpp_UAF_Extractor(DFBScanExtractor):
     """
 
     RELEASE_CALL_ARGUMENT_INDEXES = UAF_RELEASE_CALL_ARGUMENT_INDEXES
+    NULLING_RELEASE_CALLS = NULLING_UAF_RELEASE_CALLS
     UAF_SINK_NODE_TYPES = (
         "pointer_expression",
         "field_expression",
@@ -130,12 +126,19 @@ class Cpp_UAF_Extractor(DFBScanExtractor):
     def _release_call_argument_index(
         self, node: tree_sitter.Node, source_code: str | bytes
     ) -> Optional[int]:
+        call_name = self._release_call_name(node, source_code)
+        if call_name is None:
+            return None
+        return self.RELEASE_CALL_ARGUMENT_INDEXES.get(call_name)
+
+    def _release_call_name(
+        self, node: tree_sitter.Node, source_code: str | bytes
+    ) -> Optional[str]:
         if node.type != "call_expression":
             return None
         for child in node.children:
             if child.type == "identifier":
-                name = self._node_text(source_code, child)
-                return self.RELEASE_CALL_ARGUMENT_INDEXES.get(name)
+                return self._node_text(source_code, child)
         return None
 
     def _release_target_node(
@@ -214,12 +217,16 @@ class Cpp_UAF_Extractor(DFBScanExtractor):
             if len(named_children) < 2:
                 return None
             lhs = self._node_text(source_code, named_children[0])
-            rhs = self._node_text(source_code, named_children[-1])
+            rhs = self._node_text(
+                source_code, self._unwrap_source_expr(named_children[-1])
+            )
         elif node.type == "init_declarator":
             if len(named_children) < 2:
                 return None
             lhs = self._extract_declared_name(named_children[0], source_code)
-            rhs = self._node_text(source_code, named_children[-1])
+            rhs = self._node_text(
+                source_code, self._unwrap_source_expr(named_children[-1])
+            )
         else:
             return None
 
@@ -234,13 +241,7 @@ class Cpp_UAF_Extractor(DFBScanExtractor):
         expr = self._normalize_expr(expr)
         if not expr:
             return False
-        if expr in live_aliases:
-            return True
-        return any(
-            expr.startswith(alias + suffix)
-            for alias in live_aliases
-            for suffix in ("->", ".", "[")
-        )
+        return expr in live_aliases
 
     def _apply_assignment_to_aliases(
         self, live_aliases: set[str], lhs: str, rhs: str
@@ -407,6 +408,9 @@ class Cpp_UAF_Extractor(DFBScanExtractor):
         live_aliases = self._build_live_aliases_at_release(
             root_node, source_bytes, release_node, released_value.name
         )
+        release_call_name = self._release_call_name(release_node, source_bytes)
+        if release_call_name in self.NULLING_RELEASE_CALLS:
+            live_aliases.discard(self._normalize_expr(released_value.name))
 
         sinks: List[Value] = []
         events: List[tuple[int, str, tree_sitter.Node]] = []
